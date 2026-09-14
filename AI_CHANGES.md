@@ -219,3 +219,25 @@ byte 2: v2[5:4] | v3[5:0]<<2
 **Why:** fork lazy grammar was suppressed while budget sampler counted, and budget watched only ONE end tag; Qwen3.8 emits <tool_call> inside unclosed thinking → budget never DONE → tool grammar never activated → malformed <function=...> calls. Fix restores multi-turn tool calling.
 
 **Validation:** compiles clean; probe 2 consecutive tool calls across turns parse (3/3 @ temp 0.2, 1/3 @ 0.7); toy edit task 3/3 passes. Uncommitted history: prior stack backed up in engine-bin-backup-pre26262/ + oldlib/.
+
+---
+
+## Session 004 — 2026-09-11
+
+**Scope:** Remove the full-attention-KV context checkpoints on qwen35 hybrid targets (memory fix).
+
+### `src/llama-memory-hybrid.cpp`
+
+| Change | Detail |
+|--------|--------|
+| Reverted `[TAG_HYBRID_STATE_FULL]` | Restored the `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` gate in `state_write`/`state_read`: partial (checkpoint) states serialize only the recurrent state; the attention KV prefix stays live in the unified cache cells. The gate removal had made every context checkpoint a full ~16 GiB attention-KV snapshot. |
+
+### `tools/server/server-context.cpp`
+
+| Change | Detail |
+|--------|--------|
+| `create_checkpoint`: dropped `capture_host` + `KEEP_HOST` loop | The host-RAM shadow of every checkpoint (a second full copy of whatever the checkpoint held, ~16 GiB host per checkpoint after the gate removal) is dead weight with `--cache-ram 0`. Without shadows the prompt-cache salvage selection never matches and falls back to cold re-processing, same as before the shadow existed. `capture_host`/`load_*_host` remain defined but unused. |
+
+**Why:** with `--ctx-checkpoints 1` each slot carried one ~16 GiB ON_DEVICE checkpoint plus a ~16 GiB host shadow — the extra "copy of the main conversation KV" observed against llama.cpp, whose partial checkpoints are ~0.7 GiB (recurrent state only). Stock ROCmFPX main always had the gate; this restores parity.
+
+**Validation:** pending — needs a server rebuild and a repeat of the pi subagent test; expect checkpoint `size =` log lines around ~700–1500 MiB instead of ~16000 MiB, unchanged no-re-prefill behaviour at `--ctx-checkpoints 1`.
