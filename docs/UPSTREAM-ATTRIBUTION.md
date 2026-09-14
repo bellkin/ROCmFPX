@@ -111,3 +111,19 @@ Upstream/source commits used or referenced during the port:
 ROCmFP4-specific additions in the local port include preserving local ROCmFP4
 quantized tensor behavior, resolving graph conflicts, and keeping the Strix
 build/test path working.
+
+### DSV4 Compressed-KV Partial Checkpoints
+
+Local commit:
+
+- `dsv4 partial checkpoints: skip per-position rows in PARTIAL_ONLY state`
+
+The embedded DeepSeek V4 compressed-KV state in
+`llama_memory_hybrid_iswa` serialized the full per-position rows into
+every `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` checkpoint, making each
+context checkpoint as large as the whole conversation. Ported the
+partial-state semantics from upstream `llama-kv-cache-dsv4.cpp`
+(`dsv4_state_write`/`dsv4_state_read`, `DSV4_STATE_MODE_PARTIAL`): the
+per-position rows survive tail `seq_rm` in the live cache, so partial
+saves/restores now skip them and do not clear them on load; only full
+saves serialize the rows. `DSV4_COMPRESSED_KV_STATE_VERSION` bumped to 2.

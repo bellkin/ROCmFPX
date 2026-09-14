@@ -17,7 +17,7 @@
 namespace {
 
 constexpr uint32_t DSV4_COMPRESSED_KV_STATE_MAGIC   = 0x44535634; // "DSV4"
-constexpr uint32_t DSV4_COMPRESSED_KV_STATE_VERSION = 1;
+constexpr uint32_t DSV4_COMPRESSED_KV_STATE_VERSION = 2;
 constexpr uint32_t DSV4_COMPRESSED_DECODE_UBATCH_MAX = 512;
 
 struct dsv4_row_range {
@@ -436,13 +436,13 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     mem_attn->state_write(io, seq_id, flags);
     mem_recr->state_write(io, seq_id, flags);
-    dsv4_state_write(io, seq_id);
+    dsv4_state_write(io, seq_id, flags);
 }
 
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     mem_attn->state_read(io, seq_id, flags);
     mem_recr->state_read(io, seq_id, flags);
-    dsv4_state_read(io, seq_id);
+    dsv4_state_read(io, seq_id, flags);
 }
 
 void llama_memory_hybrid_iswa::dsv4_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -554,7 +554,7 @@ uint32_t llama_memory_hybrid_iswa::dsv4_n_state_rows(int32_t il, llama_seq_id se
     return (uint32_t) std::min<uint64_t>(n_rows, dsv4_cache_layers[il].n_comp);
 }
 
-void llama_memory_hybrid_iswa::dsv4_state_write(llama_io_write_i & io, llama_seq_id seq_id) const {
+void llama_memory_hybrid_iswa::dsv4_state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if (!has_dsv4_compressed_kv()) {
         return;
     }
@@ -588,10 +588,15 @@ void llama_memory_hybrid_iswa::dsv4_state_write(llama_io_write_i & io, llama_seq
     const uint32_t n_layer = hparams.n_layer;
     const uint32_t n_seq   = seq_ids.size();
 
+    // partial (checkpoint) states skip the per-position rows: those rows survive
+    // tail seq_rm in the live cache, so only full saves serialize them
+    const uint32_t partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ? 1u : 0u;
+
     io.write(&magic,   sizeof(magic));
     io.write(&version, sizeof(version));
     io.write(&n_layer, sizeof(n_layer));
     io.write(&n_seq,   sizeof(n_seq));
+    io.write(&partial, sizeof(partial));
 
     for (uint32_t il = 0; il < n_layer; ++il) {
         const auto & layer = dsv4_cache_layers[il];
@@ -618,33 +623,35 @@ void llama_memory_hybrid_iswa::dsv4_state_write(llama_io_write_i & io, llama_seq
         }
     }
 
-    for (llama_seq_id seq : seq_ids) {
-        io.write(&seq, sizeof(seq));
+    if (partial == 0) {
+        for (llama_seq_id seq : seq_ids) {
+            io.write(&seq, sizeof(seq));
 
-        for (uint32_t il = 0; il < n_layer; ++il) {
-            const auto & layer = dsv4_cache_layers[il];
-            const uint32_t n_rows = dsv4_n_state_rows(il, seq);
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                const auto & layer = dsv4_cache_layers[il];
+                const uint32_t n_rows = dsv4_n_state_rows(il, seq);
 
-            if (layer.attn_k != nullptr) {
-                const uint64_t row_size = dsv4_cache_row_size(layer.attn_k);
-                io.write(&n_rows, sizeof(n_rows));
-                if (n_rows > 0) {
-                    io.write_tensor(layer.attn_k, dsv4_cache_offset(layer.attn_k, seq, 0), (size_t) n_rows*row_size);
+                if (layer.attn_k != nullptr) {
+                    const uint64_t row_size = dsv4_cache_row_size(layer.attn_k);
+                    io.write(&n_rows, sizeof(n_rows));
+                    if (n_rows > 0) {
+                        io.write_tensor(layer.attn_k, dsv4_cache_offset(layer.attn_k, seq, 0), (size_t) n_rows*row_size);
+                    }
                 }
-            }
 
-            if (layer.index_k != nullptr) {
-                const uint64_t row_size = dsv4_cache_row_size(layer.index_k);
-                io.write(&n_rows, sizeof(n_rows));
-                if (n_rows > 0) {
-                    io.write_tensor(layer.index_k, dsv4_cache_offset(layer.index_k, seq, 0), (size_t) n_rows*row_size);
+                if (layer.index_k != nullptr) {
+                    const uint64_t row_size = dsv4_cache_row_size(layer.index_k);
+                    io.write(&n_rows, sizeof(n_rows));
+                    if (n_rows > 0) {
+                        io.write_tensor(layer.index_k, dsv4_cache_offset(layer.index_k, seq, 0), (size_t) n_rows*row_size);
+                    }
                 }
             }
         }
     }
 }
 
-void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_id seq_id) {
+void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (!has_dsv4_compressed_kv()) {
         return;
     }
@@ -669,6 +676,12 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
     }
     if (n_layer != hparams.n_layer || n_layer != dsv4_cache_layers.size()) {
         throw std::runtime_error("failed to restore DeepSeek V4 compressed KV cache: mismatched layer count");
+    }
+
+    uint32_t partial;
+    io.read(&partial, sizeof(partial));
+    if (partial != ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ? 1u : 0u)) {
+        throw std::runtime_error("failed to restore DeepSeek V4 compressed KV cache: state flags mismatch");
     }
 
     struct layer_meta {
@@ -726,15 +739,18 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
         }
     }
 
-    if (seq_id == -1) {
-        for (auto & [_, buf] : dsv4_ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+    if (partial == 0) {
+        if (seq_id == -1) {
+            for (auto & [_, buf] : dsv4_ctxs_bufs) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
+        } else {
+            dsv4_clear_seq(seq_id);
         }
-    } else {
-        dsv4_clear_seq(seq_id);
     }
 
-    for (uint32_t is = 0; is < n_seq; ++is) {
+    if (partial == 0) {
+        for (uint32_t is = 0; is < n_seq; ++is) {
         llama_seq_id src_seq_id;
         io.read(&src_seq_id, sizeof(src_seq_id));
 
@@ -769,6 +785,7 @@ void llama_memory_hybrid_iswa::dsv4_state_read(llama_io_read_i & io, llama_seq_i
                     io.read_tensor(layer.index_k, dsv4_cache_offset(layer.index_k, dst_seq_id, 0), (size_t) n_rows*row_size);
                 }
             }
+        }
         }
     }
 }

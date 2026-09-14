@@ -114,8 +114,8 @@ private:
 
     uint32_t dsv4_n_state_rows(int32_t il, llama_seq_id seq_id) const;
 
-    void dsv4_state_write(llama_io_write_i & io, llama_seq_id seq_id) const;
-    void dsv4_state_read (llama_io_read_i  & io, llama_seq_id seq_id);
+    void dsv4_state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const;
+    void dsv4_state_read (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 };
 
 class llama_memory_hybrid_iswa_context : public llama_memory_context_i {
